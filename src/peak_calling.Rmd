@@ -1,0 +1,62 @@
+---
+title: "R Notebook"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Load libraries}
+library(Seurat)
+library(Signac)
+library(tidyverse)
+```
+
+```{r Peak calling}
+pbmc.raw <- readRDS('pbmc.multiome.rds')
+
+DefaultAssay(pbmc.raw) <- "ATAC"
+
+#Change location of 'fragments' in multiome Seurat file
+Fragments(pbmc.raw@assays$ATAC) <- NULL
+fragments <- CreateFragmentObject(path = "atac_fragments.tsv.gz", 
+                                  cells = colnames(pbmc.raw), 
+                                  validate.fragments = TRUE)
+Fragments(pbmc.raw@assays$ATAC) <- fragments
+
+# Call peaks using MACS2
+#options(future.globals.maxSize = 50 * 1024 ^ 3)
+#plan("multisession", workers = 15)
+peaks <- CallPeaks(pbmc.raw, macs2.path = '/home/ftencat/anaconda3/bin/macs2')
+
+# Remove peaks on nonstandard chromosomes and in genomic blacklist regions
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_hg38_unified, invert = TRUE)
+
+# Save peaks file
+dir.create("peaks")
+save(peaks, file = "peaks/peaks.RData")
+
+# Quantify counts in each peak
+macs2_counts <- FeatureMatrix(
+  fragments = Fragments(pbmc.raw),
+  features = peaks,
+  cells = colnames(pbmc.raw)
+)
+
+library(EnsDb.Hsapiens.v86)
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "hg38"
+
+fragpath = "atac_fragments.tsv.gz"
+
+# Create a new assay using the MACS2 peak set and add it to the pbmc object
+pbmc.raw[["peaks"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = fragpath,
+  annotation = annotations
+)
+
+pbmc.raw[['ATAC']] <- NULL
+saveRDS(pbmc.raw, 'pbmc.multiome.peak.recalling.rds')
+```
+

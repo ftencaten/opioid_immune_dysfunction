@@ -1,0 +1,1146 @@
+---
+title: "Multiome analysis - Lancioni"
+editor_options: 
+  chunk_output_type: console
+author: "Felipe ten Caten - ftencat@emory.edu"
+---
+
+```{r Load libraries}
+library(Seurat)
+library(Signac)
+library(tidyverse)
+#library(EnsDb.Hsapiens.v86)
+```
+
+```{r Pre-processing}
+#aggr file
+aggr <- read_csv('data/raw/aggr.csv')
+
+aggr.id <- aggr %>% 
+  mutate(barcode_id = row_number()) %>%  
+  mutate(library_id = sub('.*_', '', library_id)) %>% 
+  dplyr::select(barcode_id, library_id)
+
+# barcode metric
+barcode_metric_files <- list.files('data/raw/barcode_metrics', full.names = T)
+
+meta <- read_csv(barcode_metric_files, id = "path") %>% 
+  dplyr::filter(is_cell == 1)
+
+metadata <- meta %>% 
+  mutate(path = sub('.*_', '', path)) %>% 
+  mutate(path = sub('.csv', '', path)) %>% 
+  left_join(aggr.id, by = c('path' = 'library_id')) %>% 
+  relocate(barcode_id) %>% 
+  mutate(barcode = paste0(sub('1', '', barcode), barcode_id)) %>% 
+  dplyr::select(-c(barcode_id, path)) 
+
+# the 10x hdf5 file contains both data types
+inputdata.10x <- Read10X_h5("data/raw/filtered_feature_bc_matrix.h5")
+
+# extract RNA and ATAC data
+rna_counts <- inputdata.10x$`Gene Expression`
+atac_counts <- inputdata.10x$Peaks
+
+# Create Seurat object from RNA-seq counts
+pbmc <- CreateSeuratObject(counts = rna_counts, min.cells = 3)
+
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+
+## Add metadata
+pheno <- readxl::read_excel('data/raw/Multiome_Wetlab_data_Feb06_2023.xlsx') %>% 
+  dplyr::filter(Cohort == 'Lancioni') %>% 
+  dplyr::select(`Sample Number`, `Sample Name`) %>% 
+  mutate(group.timepoint = sub(' .*', '', `Sample Name`)) %>% 
+  mutate(timepoint = sub('.*_', '', group.timepoint)) %>% 
+  mutate(group = sub('_M.*', '', group.timepoint)) %>% 
+  relocate(`Sample Number`, `Sample Name`, group, timepoint, group.timepoint) %>% 
+  mutate(`Sample Number` = paste0('s', `Sample Number`)) %>% 
+  left_join(aggr.id, by = c('Sample Number' = 'library_id')) %>% 
+  dplyr::filter(!is.na(barcode_id))
+
+pbmc@meta.data$barcode_id <- as.double(sub('.*-', '', colnames(pbmc)))
+
+meta.pmbc <- pbmc@meta.data %>% 
+  rownames_to_column('barcode') %>% 
+  left_join(pheno) %>% 
+  left_join(metadata %>% dplyr::select(barcode, atac_peak_region_fragments,
+                                       atac_fragments)) %>% 
+  column_to_rownames('barcode')
+
+pbmc <- AddMetaData(pbmc, meta.pmbc)
+
+# Add in the ATAC-seq data
+# removing peaks that are in scaffolds (no standard chromosomes)
+grange.counts <- StringToGRanges(rownames(atac_counts), sep = c(":", "-"))
+grange.use <- seqnames(grange.counts) %in% standardChromosomes(grange.counts)
+atac_counts <- atac_counts[as.vector(grange.use), ]
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "hg38"
+
+frag.file <- "data/raw/atac_fragments.tsv.gz"
+chrom_assay <- CreateChromatinAssay(
+   counts = atac_counts,
+   sep = c(":", "-"),
+   genome = 'hg38',
+   fragments = frag.file,
+   min.cells = 10,
+   annotation = annotations
+ )
+
+pbmc[["ATAC"]] <- chrom_assay
+
+pbmc <- NucleosomeSignal(pbmc, assay = 'ATAC')
+pbmc <- TSSEnrichment(object = pbmc, assay = 'ATAC')
+
+pbmc$pct_reads_in_peaks <- pbmc$atac_peak_region_fragments / pbmc$atac_fragments * 100
+pbmc$blacklist_fraction <- FractionCountsInRegion(object = pbmc, assay = "ATAC",
+                                                  regions = blacklist_hg38)
+
+### Save RDS before subseting
+#saveRDS(pbmc, 'data/processed/pbmc.multiome.rds')
+#pbmc <- readRDS('data/processed/pbmc.multiome.rds')
+
+vlnatac <- VlnPlot(
+  object = pbmc,
+  features = c('nCount_ATAC', 'TSS.enrichment', 'nucleosome_signal', 'pct_reads_in_peaks'),
+  pt.size = 0,
+  ncol = 4
+) 
+
+ggsave('results/multiome/violinplot_atac_pbmcln.pdf', vlnatac, device = pdf,
+       width = 9.5, height = 4.5)
+
+### Quality control RNA
+VlnPlot(pbmc, features = c("nCount_ATAC", "nCount_RNA","percent.mt"), ncol = 3,
+        log = TRUE, pt.size = 0) + NoLegend()
+
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA","percent.mt"), ncol = 3,
+        log = TRUE, pt.size = 0) + NoLegend()
+
+VlnPlot(pbmc, features = c("nFeature_RNA"), group.by = 'Sample.Name',
+        pt.size = 0) + NoLegend() + geom_hline(yintercept = 300)
+
+VlnPlot(pbmc, features = c("nCount_RNA"), ncol = 3,
+        log = TRUE, pt.size = 0) + NoLegend() + 
+  geom_hline(yintercept = c(500, 25000))
+
+VlnPlot(pbmc, features = c("nCount_ATAC"), ncol = 3,
+        log = TRUE, pt.size = 0) + NoLegend() + 
+  geom_hline(yintercept = c(1000, 70000))
+
+VlnPlot(pbmc, features = c("pct_reads_in_peaks"), group.by = 'Sample.Name',
+        log = TRUE, pt.size = 0) + NoLegend() 
+
+RidgePlot(pbmc, features = c("nFeature_RNA"), group.by = 'Sample Number') + NoLegend()
+RidgePlot(pbmc, features = c("nCount_RNA"), group.by = 'Sample Number', log = T)  + NoLegend()
+RidgePlot(pbmc, features = c("percent.mt"), group.by = 'Sample Number') + NoLegend()
+
+RidgePlot(pbmc, features = c("nFeature_ATAC"), group.by = 'Sample Number') + NoLegend()
+RidgePlot(pbmc, features = c("nCount_ATAC"), group.by = 'Sample Number', log = T)  + NoLegend()
+
+### Quality control ATAC
+VlnPlot(pbmc, features = c('atac_peak_region_fragments', 
+                           'blacklist_fraction'), pt.size = 0, log = T)
+
+VlnPlot(pbmc, features = c('TSS.enrichment', 'nucleosome_signal'), pt.size = 0)
+
+RidgePlot(pbmc, features = c("TSS.enrichment"), group.by = 'Sample.Number') + NoLegend()
+RidgePlot(pbmc, features = c("nucleosome_signal"), group.by = 'Sample.Number') + NoLegend()
+
+TSSPlot(pbmc, group.by = 'high.tss', assay = 'ATAC') + NoLegend()
+```
+
+```{r Peak recalling after filter out low quality cells}
+pbmc <- readRDS('data/processed/pbmc.multiome.rds')
+
+# filter out low quality cells
+pbmc <- subset(x = pbmc,
+  subset = nCount_ATAC < 70000 &
+    nCount_ATAC > 1000 &
+    nCount_RNA < 25000 &
+    nCount_RNA > 500 &
+    nFeature_RNA > 300 &
+    percent.mt < 25 &
+    nucleosome_signal < 2 &
+    TSS.enrichment > 2 &
+    pct_reads_in_peaks > 20 &
+    blacklist_fraction < 0.05 &
+    atac_peak_region_fragments > 2000 &
+    atac_peak_region_fragments < 50000 
+)
+
+## Doublet identification
+library(DoubletFinder)
+
+pbmc.diet <- DietSeurat(pbmc, assays = 'RNA')
+
+pbmc.list <- SplitObject(pbmc.diet, split.by = 'Sample.Number')
+
+pbmc.list <- lapply(pbmc.list, 
+                   function(x) {
+                     x <- NormalizeData(x) |> 
+                       FindVariableFeatures() |> 
+                       ScaleData() |> 
+                       RunPCA()
+                     x <- FindNeighbors(x, dims = 1:15)
+                     x <- FindClusters(x)
+                     x <- RunUMAP(x, dims = 1:15)
+                     
+                     sweep.res.list <- paramSweep(x, PCs = 1:15)
+                     sweep.res.nsclc <- summarizeSweep(sweep.res.list)
+                     bcmvn_nsclc <- find.pK(sweep.res.nsclc)
+                     
+                     pK <- bcmvn_nsclc %>% 
+                       dplyr::filter(BCmetric == max(BCmetric)) %>% 
+                       select(pK)
+                     pK <- as.numeric(as.character(pK[[1]]))
+                     
+                     annotations <- x@meta.data$seurat_clusters
+                     homotic.prop <- modelHomotypic(annotations)
+                     nExp_poi <- round(0.05*nrow(x@meta.data))
+                     nExp_poi.adj <- round(nExp_poi*(1-homotic.prop))
+                     
+                     doubletFinder(x, pK = pK, PCs = 1:15, nExp = nExp_poi.adj)})
+
+meta.data.list <- lapply(pbmc.list, function(x) {
+  colnames(x@meta.data) <- sub('_0.25.*', '', colnames(x@meta.data))
+  return(x@meta.data)
+  })
+
+metadata.df <- bind_rows(meta.data.list)
+                      
+pbmc <- AddMetaData(pbmc, metadata.df)
+
+rm(pbmc.list)
+rm(pbmc.diet)
+gc()
+
+#### GEX
+DefaultAssay(pbmc) <- 'RNA'
+
+pbmc@meta.data$patientid <- sub('.*_', '', pbmc@meta.data$Sample.Name)
+
+pbmc <- NormalizeData(pbmc) %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>% 
+  RunPCA()
+
+ElbowPlot(pbmc, ndims=50)
+
+pbmc <- RunUMAP(pbmc, dims = 1:10)
+
+DimPlot(pbmc)
+
+DimPlot(pbmc, split.by = 'DF.classifications')
+
+DimPlot(pbmc, group.by = 'Sample.Name', cols = 'glasbey')
+
+DimPlot(pbmc, split.by = 'Sample.Name', ncol = 4, 
+        group.by = 'Sample.Name',
+        cols = 'glasbey')
+
+DimPlot(pbmc, split.by = 'patientid', ncol = 4, 
+        group.by = 'patientid',
+        cols = 'glasbey')
+
+DimPlot(pbmc, split.by = 'group',  
+        group.by = 'group',
+        cols = 'glasbey')
+
+DimPlot(pbmc, split.by = 'group.timepoint',  ncol = 3, 
+        group.by = 'group.timepoint',
+        cols = 'glasbey')
+
+### Remove doublets
+pbmc <- subset(pbmc, subset = DF.classifications == 'Singlet')
+
+# Call peaks using MACS2
+#options(future.globals.maxSize = 50 * 1024 ^ 3)
+#plan("multisession", workers = 15)
+library(GenomeInfoDb)
+DefaultAssay(pbmc) <- "ATAC"
+peaks <- CallPeaks(pbmc, macs2.path = '/Users/ftencat/opt/anaconda3/bin/macs2')
+
+# Remove peaks on nonstandard chromosomes and in genomic blacklist regions
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_hg38_unified, invert = TRUE)
+
+# Save peaks file
+dir.create("data/processed/peaks")
+save(peaks, file = "data/processed/peaks/peaks.RData")
+
+# Quantify counts in each peak
+macs2_counts <- FeatureMatrix(
+  fragments = Fragments(pbmc),
+  features = peaks,
+  cells = colnames(pbmc)
+)
+
+library(EnsDb.Hsapiens.v86)
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "hg38"
+
+fragpath = "data/raw/atac_fragments.tsv.gz"
+
+# Create a new assay using the MACS2 peak set and add it to the pbmc object
+pbmc[["peaks"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = fragpath,
+  annotation = annotations
+)
+
+DefaultAssay(pbmc) <- 'peaks'
+
+pbmc[['ATAC']] <- NULL
+#saveRDS(pbmc, 'data/processed/pbmc.peak.recalling.rds')
+```
+
+```{r GEX + ATAC - Dim reduction and integration}
+pbmc <- readRDS('data/processed/pbmc.peak.recalling.rds')
+
+#### ATAC
+DefaultAssay(pbmc) <- "peaks"
+
+pbmc <- FindTopFeatures(pbmc, min.cutoff = 5) %>% 
+  RunTFIDF() %>% 
+  RunSVD()
+
+DepthCor(pbmc)
+
+pbmc <- RunUMAP(pbmc, reduction = 'lsi', dims = 2:10, 
+                reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+
+DimPlot(pbmc, group.by = 'Sample.Name', cols = 'glasbey')
+
+DimPlot(pbmc, split.by = 'Sample.Name', ncol = 4, 
+        group.by = 'Sample.Name', cols = 'glasbey') + NoLegend()
+
+## Integrate ATAC
+DefaultAssay(pbmc) <- 'peaks'
+pbmc.list <- SplitObject(pbmc, split.by = 'Sample.Number')
+
+# find integration anchors
+integration.anchors <- FindIntegrationAnchors(
+  object.list = pbmc.list,
+  anchor.features = pbmc.list$s18,
+  reduction = "rlsi",
+  dims = 2:30
+)
+
+# integrate LSI embeddings
+integrated <- IntegrateEmbeddings(
+  anchorset = integration.anchors,
+  reductions = pbmc[["lsi"]],
+  new.reduction.name = "integrated_lsi",
+  dims.to.integrate = 1:30
+)
+
+# create a new UMAP using the integrated embeddings
+integrated <- RunUMAP(integrated, reduction = "integrated_lsi", dims = 2:30, 
+                      reduction.name = 'umap.atac')
+
+DimPlot(integrated, group.by = 'Sample.Name', cols = 'glasbey')
+
+DimPlot(integrated, ncol = 4, group.by = 'Sample.Name', 
+        split.by = 'Sample.Name', cols = 'glasbey') + NoLegend()
+
+pbmc <- integrated
+
+rm(integrated, integration.anchors, pbmc.list, pbmc.se)
+gc()
+
+#### GEX
+DefaultAssay(pbmc) <- 'RNA'
+
+pbmc[["RNA"]] <- JoinLayers(pbmc[["RNA"]], 
+                            layers = c('scale', 'data', 'counts'))
+
+pbmc <- NormalizeData(pbmc) %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>% 
+  RunPCA()
+
+ElbowPlot(pbmc, ndims=50)
+
+pbmc <- RunUMAP(pbmc, dims = 1:15)
+
+p <- DimPlot(pbmc)
+
+p <- DimPlot(pbmc, group.by = 'Sample.Name', cols = 'glasbey')
+
+p <- DimPlot(pbmc, split.by = 'Sample.Name', ncol = 4, 
+        group.by = 'Sample.Name',
+        cols = 'glasbey')
+
+### RPCA Integration
+pbmc[["RNA"]] <- split(pbmc[["RNA"]], f = pbmc$Sample.Number)
+
+pbmc <- NormalizeData(pbmc) %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>% 
+  RunPCA()
+
+options(future.globals.maxSize = 50 * 1024 ^ 3)
+pbmc <- IntegrateLayers(object = pbmc, method = RPCAIntegration, verbose = FALSE,
+                        orig.reduction = "pca", new.reduction = "integrated.rpca")
+
+pbmc <- RunUMAP(pbmc, dims = 1:30, reduction = "integrated.rpca")
+
+DimPlot(pbmc, group.by = 'Sample.Name', cols = 'glasbey')
+
+DimPlot(pbmc, split.by = 'Sample.Name', ncol = 4, 
+        group.by = 'Sample.Name', cols = 'glasbey')
+
+
+pbmc[["RNA"]] <- JoinLayers(pbmc[["RNA"]], 
+                            layers = c('scale', 'data', 'counts'))
+
+### Cell type annotation - Azimuth
+library(Azimuth)
+library(SeuratData)
+
+DefaultAssay(pbmc) <- 'RNA'
+
+pbmc <- RunAzimuth(pbmc, reference = "pbmcref")
+
+DimPlot(pbmc, group.by = 'predicted.celltype.l1', label = T, label.box = T,
+        repel = T, reduction = 'wnn.umap') + NoLegend()
+DimPlot(pbmc, group.by = 'predicted.celltype.l2', label = T, label.box = T,
+        repel = T) + NoLegend()
+
+### Cell type annotation - SingleR - Monaco
+library(SingleR)
+library(celldex)
+
+# Load reference dataset
+monaco.se <- MonacoImmuneData()
+
+# Transform Seurat object to SingleCellExperiment
+pbmc.se <- as.SingleCellExperiment(pbmc)
+
+pred.pbmc.main <- SingleR(test = pbmc.se, ref = monaco.se,
+                    labels =  monaco.se$label.main)
+
+main.pred <- as.data.frame(pred.pbmc.main) %>% 
+  rownames_to_column('cell_ids')  %>%  
+  dplyr::select(cell_ids, labels, pruned.labels) %>%
+  dplyr::rename(singler.monaco.main.labels = labels, 
+         singler.monaco.main.pruned.labels = pruned.labels)
+  
+pred.pbmc.fine <- SingleR(test = pbmc.se, ref = monaco.se,
+                    labels =  monaco.se$label.fine)
+
+fine.pred <- as.data.frame(pred.pbmc.fine) %>% 
+  rownames_to_column('cell_ids') %>%  
+  dplyr::select(cell_ids,  labels, pruned.labels) %>%
+  dplyr::rename(singler.monaco.fine.labels = labels, 
+         singler.monaco.fine.pruned.labels = pruned.labels)
+
+pbmc.meta <- pbmc@meta.data %>%
+  rownames_to_column('cell_ids') %>%
+  left_join(main.pred) %>% 
+  left_join(fine.pred) %>% 
+  column_to_rownames('cell_ids')
+  
+pbmc <- AddMetaData(pbmc, pbmc.meta)
+
+DimPlot(pbmc, group.by = 'singler.monaco.main.labels', label = T, repel = T, 
+        label.box = T) + NoLegend()
+
+
+## WNN Integration
+DefaultAssay(pbmc) <- 'RNA'
+
+pbmc <- FindMultiModalNeighbors(pbmc, 
+                                reduction.list = list("integrated.rpca", 
+                                                      "integrated_lsi"),
+                                dims.list = list(1:30, 2:30),
+                                verbose = TRUE)
+
+# build a joint UMAP visualization
+pbmc <- RunUMAP(pbmc, nn.name = "weighted.nn", reduction.name = "wnn.umap",
+                reduction.key = "wnnUMAP_", verbose = TRUE)
+
+pbmc <- FindClusters(pbmc, graph.name = "wsnn", algorithm = 3, verbose = FALSE)
+
+DimPlot(pbmc, reduction = 'wnn.umap')
+
+DimPlot(pbmc, reduction = 'wnn.umap', 
+        group.by = 'Sample.Name', 
+        cols = 'glasbey')
+
+DimPlot(pbmc, reduction = 'wnn.umap', ncol = 4,
+        group.by = 'Sample.Name', 
+        split.by = 'Sample.Name',
+        cols = 'glasbey') + NoLegend()
+
+#saveRDS(pbmc, 'data/processed/pbmc.wnn.azi.singler.dbltfinder.rds')
+#pbmc <- readRDS('data/processed/pbmc.wnn.azi.singler.dbltfinder.rds')
+```
+
+```{r Group comparison}
+#pbmc <- readRDS('data/processed/pbmc.wnn.azi.singler.dbltfinder.rds')
+
+rna <- DimPlot(pbmc, reduction = 'umap', group.by = 'Sample.Name', 
+               cols = 'glasbey') + NoLegend() + ggtitle('RNA')
+
+#ggsave('results/figures/umap_pbmc_rna.png', rna, dpi = 'retina', 
+#       width = 5, height = 5)
+
+atac <- DimPlot(pbmc, reduction = 'umap.atac', group.by = 'Sample.Name', 
+               cols = 'glasbey') + NoLegend() + ggtitle('ATAC')
+
+#ggsave('results/figures/umap_pbmc_atac.png', atac, dpi = 'retina', 
+#       width = 5, height = 5)
+  
+wnn <- DimPlot(pbmc, reduction = 'wnn.umap', group.by = 'Sample.Name', 
+               cols = 'glasbey') + ggtitle('Integrated RNA + ATAC')
+
+#ggsave('results/figures/umap_pbmc_wnn_integration.png', wnn, dpi = 'retina', 
+#       width = 7, height = 5)
+
+
+main.annotation <- DimPlot(pbmc, group.by = 'singler.monaco.main.labels', 
+                           label = T, label.box = T,
+                           repel = T, reduction = 'wnn.umap', label.size = 4) + 
+  NoLegend()
+
+#ggsave('results/figures/umap_singler_monaco_annotation.png', main.annotation, 
+#       height = 6, width = 6, dpi = 'retina')
+
+## variancePartition
+library(variancePartition)
+
+pbmc$sample.name.cell.type <- paste0(pbmc$Sample.Name, pbmc$predicted.celltype.l1)
+
+aggr <- AggregateExpression(pbmc, assays = 'RNA', 
+                            group.by = 'Sample.Name')
+
+viral.load <- read_tsv('data/processed/cd4_counts_hiv_vl_multiome_samples.tsv') 
+
+pheno <- pbmc@meta.data |> 
+  select(Sample.Name, group, timepoint, group.timepoint) |> 
+  unique() |> 
+  remove_rownames() |> 
+  left_join(viral.load) |> 
+  mutate(`HIV Viral Load` = ifelse(`HIV Viral Load` == 'UD', 15, `HIV Viral Load`)) |> 
+  mutate(`HIV Viral Load` = as.double(`HIV Viral Load`)) |> 
+  mutate(patientid = sub('.* ', '', Sample.Name)) |> 
+  column_to_rownames('Sample.Name') |> 
+  mutate(log_hiv_vl = log10(`HIV Viral Load`))
+
+geneCounts <- as.data.frame(aggr)
+
+# identify genes that pass expression cutoff
+isexpr <- rowSums(cpm(geneCounts) > 1) >= 0.5 * ncol(geneCounts)
+
+### PCA
+cpm.geneCounts <- cpm(geneCounts)
+
+V <- apply(cpm.geneCounts, 1, var)
+selectedGenes <- names(V[order(V, decreasing = T)][1:10000])
+
+M <- t(cpm.geneCounts[selectedGenes,])
+M <- log1p(M)
+pcaResults <- prcomp(M, scale. = T)
+
+autoplot(pcaResults, data = pheno, 
+         fill = 'group.timepoint', size = 3, shape = 21) +
+  scale_fill_manual(values = RColorBrewer::brewer.pal(7, 'Dark2')) +
+  theme_bw()
+
+autoplot(pcaResults, data = pheno, 
+         fill = 'patientid', size = 3, shape = 21) +
+  theme_bw()
+
+autoplot(pcaResults, data = pheno, 
+         fill = 'log_hiv_vl', size = 3, shape = 21) +
+  scale_fill_viridis_c()+
+  theme_bw()
+
+
+# create data structure with only expressed genes
+gExpr <- DGEList(counts = geneCounts[isexpr, ], samples = pheno)
+
+# Perform TMM normalization
+gExpr <- calcNormFactors(gExpr)
+
+# Specify variables to be included in the voom() estimates of
+# uncertainty.
+# Recommend including variables with a small number of categories
+# that explain a substantial amount of variation
+design <- model.matrix(~predicted.celltype.l1, pheno)
+
+# Estimate precision weights for each gene and sample
+# This models uncertainty in expression measurements
+vobjGenes <- voom(gExpr, design)
+
+# Define formula
+form <- ~ predicted.celltype.l1 + group.timepoint + `HIV Viral Load` + `CD4 count`
+
+# variancePartition seamlessly deals with the result of voom()
+# by default, it seamlessly models the precision weights
+# This can be turned off with useWeights=FALSE
+varPart <- fitExtractVarPartModel(vobjGenes, form, pheno)
+
+vp <- sortCols(varPart)
+
+variance.plot <- plotVarPart(vp) 
+
+#### DEGs analysis using singleR M6 group
+pbmc$group.timepoint.singler.fine.label <- paste(pbmc$group.timepoint,
+                                                 pbmc$singler.monaco.fine.labels)
+
+Idents(pbmc) <- pbmc$group.timepoint.singler.fine.label
+
+#Analyse only subsets with more than 100 cells
+subsets <- names(which(table(pbmc$singler.monaco.fine.labels) > 100))
+
+### M6
+degs.list <- list()
+
+for(i in seq_along(subsets)) {
+  degs.list[[i]] <- FindMarkers(pbmc,
+                                ident.1 = paste('XR_NTX_M6', subsets[i]),
+                                ident.2 = paste('TAU_M6', subsets[i]))
+}
+names(degs.list) <- subsets
+
+gene_set_c <- msigdbr::msigdbr(category = 'C2') |> 
+  filter(grepl('CP:', gs_subcat)) |> 
+  select(gs_name, gene_symbol) |> 
+  unique() |> 
+  filter(grepl('(MYD88|TLR)', gs_name)) 
+
+gene_set_h <- msigdbr::msigdbr(category = 'H') %>% 
+  select(gs_name, gene_symbol) %>% 
+  mutate(gs_name = sub('HALLMARK_', '', gs_name))  
+#  bind_rows(gene_set_c)
+
+ranks.list <- list()
+for (i in seq_along(degs.list)) {
+  ranks.list[[i]] <- degs.list[[i]] %>%
+    mutate(p_val = ifelse(p_val == 0, .Machine$double.xmin*row_number(), p_val)) %>% 
+    mutate(rank = -log10(p_val)*sign(avg_log2FC)) %>% 
+    #mutate(rank = avg_log2FC) %>%
+    dplyr::select(rank) %>% 
+    rownames_to_column() %>% 
+    arrange(dplyr::desc(rank)) %>% 
+    deframe() 
+}
+names(ranks.list) <- names(degs.list)
+
+gsea.list <- compareCluster(ranks.list, fun = 'GSEA', 
+                            TERM2GENE = gene_set_h, eps = 0)
+
+tnf.subsets <- gsea.list@compareClusterResult |> 
+  filter(ID == 'TNFA_SIGNALING_VIA_NFKB') |> 
+  select(Cluster) |> 
+  deframe()
+
+ntx_vs_tau_m6 <- dotplot(gsea.list |> filter(Cluster %in% tnf.subsets), 
+                         color = 'NES', label_format = 35, 
+                         showCategory = Inf) +
+  scale_fill_viridis_c(option = 'H') +
+  RotatedAxis()
+
+dotplot(gsea.list, 
+         color = 'NES', label_format = 50, 
+          showCategory = Inf) +
+  scale_fill_viridis_c(option = 'H') +
+  RotatedAxis()
+
+ggsave('results/figures/gsea_dotplot_ntx_vs_tau_m6.pdf', ntx_vs_tau_m6, scale = 0.9)
+
+tnf.mono <- gsea.list@compareClusterResult |> 
+  filter(Cluster == 'Classical monocytes', ID %in% c('TNFA_SIGNALING_VIA_NFKB')) |> 
+  select(core_enrichment) |> separate_longer_delim(core_enrichment, delim = '/') |> 
+  deframe()
+
+pbmc.m6 <- subset(pbmc, subset = group.timepoint %in% c('XR_NTX_M6', 'TAU_M6'))
+
+
+pbmc$sample.name.annot <- paste(pbmc$Sample.Name,
+                                pbmc$singler.monaco.fine.labels)
+
+aggr <- AggregateExpression(pbmc, assays = 'RNA', 
+                            group.by = 'sample.name.annot')
+
+cpm.aggr <- cpm(as.data.frame(aggr), log = T)
+
+tnf.mono.cpm <- cpm.aggr |> 
+  as.data.frame() |> 
+  rownames_to_column('genesymbol') |> 
+  pivot_longer(-genesymbol) |> 
+  filter(genesymbol %in% tnf.mono,
+         grepl('Classical.monocytes', name)) |> 
+  filter(grepl('M6', name)) |> 
+  pivot_wider(names_from = 'name', values_from = 'value') |> 
+  column_to_rownames('genesymbol')
+
+scaled.expr <- t(scale(t(tnf.mono.cpm)))
+
+column_ha = HeatmapAnnotation(Group.timepoint = 
+                                sub('.067.*', '', sub('RNA.', '',colnames(scaled.expr))), 
+                              col = list(Group.timepoint =  
+                                           c("TAU.M6" = "#66C2A5", "XR.NTX.M6" = "#8DA0CB")))
+  
+Heatmap(scaled.expr, name = 'z-score CPM',  show_column_names = F,
+        width = unit(3, "cm"), height = unit(15, 'cm'),
+        rect_gp = gpar(col = "black", lwd = 0.2), 
+        row_names_gp = gpar(fontsize = 8), top_annotation = column_ha)
+
+
+nfkb.split <- FeaturePlot(pbmc.m6, reduction = 'wnn.umap', features = c('NFKB1'), 
+            max.cutoff = 'q95', split.by = 'group.timepoint')
+
+ggsave('results/figures/umap_m6_split_nfkb.png', nfkb.split,
+       height = 5, width = 10, dpi = 'retina')
+
+tnf.vln <- VlnPlot(pbmc.m6, features = c('NFKB1', 'IL1B', 'IL6ST', 'FOSL1', 'JUNB', 'TNFAIP8'), 
+        group.by = 'group.timepoint', idents = 'Classical monocytes', pt.size = 0)
+
+#ggsave('results/figures/violin_plot_inflammatory_markers.pdf', tnf.vln,
+#       scale = 0.9)
+
+### M3
+degs.list.m3 <- list()
+
+for(i in seq_along(subsets)) {
+  degs.list.m3[[i]] <- FindMarkers(pbmc,
+                              ident.1 = paste('XR_NTX_M3', subsets[i]),
+                              ident.2 = paste('TAU_M3', subsets[i]))
+}
+names(degs.list.m3) <- subsets
+
+gene_set_h <- msigdbr::msigdbr(category = 'H') %>% 
+  select(gs_name, gene_symbol) %>% 
+  mutate(gs_name = sub('HALLMARK_', '', gs_name))
+
+ranks.list.m3 <- list()
+for (i in seq_along(degs.list.m3)) {
+  ranks.list.m3[[i]] <- degs.list.m3[[i]] %>%
+    mutate(p_val = ifelse(p_val == 0, .Machine$double.xmin*row_number(), p_val)) %>% 
+    mutate(rank = -log10(p_val)*sign(avg_log2FC)) %>% 
+    dplyr::select(rank) %>% 
+    rownames_to_column() %>% 
+    arrange(dplyr::desc(rank)) %>% 
+    deframe() 
+}
+names(ranks.list.m3) <- names(degs.list.m3)
+
+gsea.list.m3 <- compareCluster(ranks.list.m3, fun = 'GSEA', 
+                            TERM2GENE = gene_set_h, eps = 0)
+
+ntx_vs_tau_m3 <- dotplot(gsea.list.m3, color = 'NES', label_format = 35) +
+  scale_fill_viridis_c(option = 'H') +
+  RotatedAxis()
+
+#ggsave('results/figures/gsea_dotplot_ntx_vs_tau_m3.pdf', ntx_vs_tau_m3, scale = 0.8)
+
+### Chromvar
+library(JASPAR2020)
+library(TFBSTools)
+
+DefaultAssay(pbmc) <- 'peaks'
+ 
+pfm <- getMatrixSet(x = JASPAR2020,
+                    opts = list(collection = "CORE", tax_group = 'vertebrates', 
+                                all_versions = FALSE))
+
+library(BSgenome.Hsapiens.UCSC.hg38)
+
+pbmc <- AddMotifs(object = pbmc, genome = Hsapiens, pfm = pfm)
+
+pbmc <- RunChromVAR(object = pbmc, genome = Hsapiens)
+
+DefaultAssay(pbmc) <- 'chromvar'
+
+## Compare ntx vs tau
+
+Idents(pbmc) <- pbmc$group.timepoint.singler.fine.label
+
+#Analyse only subsets with more than 100 cells
+subsets <- names(which(table(pbmc$singler.monaco.fine.labels) > 100))
+
+motif.list <- list()
+
+for(i in seq_along(subsets)) {
+    motif.list[[i]] <- FindMarkers(pbmc, 
+                                  ident.1 = paste('XR_NTX_M6', subsets[i]), 
+                                  ident.2 = paste('TAU_M6', subsets[i]),
+                                  mean.fxn = rowMeans,
+                                  fc.name = "avg_diff")
+}
+
+names(motif.list) <- subsets
+
+motif.list.name <- bind_rows(motif.list, .id = 'id') %>% 
+  rownames_to_column('name') %>% 
+  mutate(name = sub('\\.\\.\\..*', '', name)) %>% 
+  left_join(enframe(name(pfm))) %>% 
+  dplyr::filter(p_val_adj < 0.05)
+
+motif.mat <- motif.list.name |> 
+  dplyr::select(id, value, avg_diff) |> 
+  pivot_wider(names_from = 'id', values_from = 'avg_diff') |> 
+  arrange(value) |> 
+  column_to_rownames('value')
+
+motif.mat <- motif.mat[which(rowSums(is.na(motif.mat)) <= ncol(motif.mat)* 2/3),]
+
+#motif.of.interest <- c('STAT1', 'STAT3', 'IRF3', 'IRF7', 'FOS', 'FOS::JUN', 'MAF::NFE2',
+#                      "Smad2::Smad3", "GATA3", "TCF7")
+
+#motif.position <- which(rownames(motif.mat.ordered) %in% motif.of.interest)
+
+#ha = rowAnnotation(foo = anno_mark(at = motif.position, 
+#    labels = rownames(motif.mat.ordered)[motif.position]))
+
+Heatmap(motif.mat, name = 'FC', cluster_rows = F, cluster_columns = F,
+        col = colorRamp2(breaks = c(-2, -1,  0, 1, 2), 
+                         c('darkblue', 'blue', 'white', 'red', 'darkred')), 
+        show_row_names = T, 
+        width = unit(6, 'cm'),
+        row_names_gp = grid::gpar(fontsize = 4),
+        column_names_gp = grid::gpar(fontsize = 5),
+        height = unit(6, 'cm'), 
+        #right_annotation = ha, 
+        column_names_rot = 60)
+
+#saveRDS(ln.obj, 'data/processed/new/ln.integrated.annot.geneactivity.chromvar.rds')
+
+```
+
+```{r GEX Analyis - old}
+# RDS files from this analysis where transfered to "old" directory inside
+# /data directory
+pbmc.raw <- readRDS('data/processed/pbmc.multiome.peak.recalling.rds')
+
+### Subset dataset
+pbmc <- subset(x = pbmc.raw,
+  subset = nCount_ATAC < 70000 &
+    nCount_ATAC > 1000 &
+    nCount_RNA < 25000 &
+    nCount_RNA > 500 &
+    nFeature_RNA > 300 &
+    percent.mt < 25 &
+    nucleosome_signal < 2 &
+    TSS.enrichment > 2 &
+    pct_reads_in_peaks > 20 &
+    blacklist_fraction < 0.05 &
+    atac_peak_region_fragments > 2000 &
+    atac_peak_region_fragments < 50000 
+)
+
+#### GEX
+DefaultAssay(pbmc) <- 'RNA'
+
+pbmc@meta.data$patientid <- sub('.*_', '', pbmc@meta.data$Sample.Name)
+
+pbmc <- NormalizeData(pbmc) %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>% 
+  RunPCA()
+
+ElbowPlot(pbmc, ndims=50)
+
+pbmc <- RunUMAP(pbmc, dims = 1:10)
+
+DimPlot(pbmc)
+
+DimPlot(pbmc, group.by = 'Sample.Name', cols = 'glasbey')
+
+DimPlot(pbmc, split.by = 'Sample.Name', ncol = 4, 
+        group.by = 'Sample.Name',
+        cols = 'glasbey')
+
+DimPlot(pbmc, split.by = 'patientid', ncol = 4, 
+        group.by = 'patientid',
+        cols = 'glasbey')
+
+DimPlot(pbmc, split.by = 'group',  
+        group.by = 'group',
+        cols = 'glasbey')
+
+### RPCA Integration
+pbmc.list <- SplitObject(pbmc, split.by = "patientid")
+
+pbmc.list <- lapply(X = pbmc.list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+})
+
+features <- SelectIntegrationFeatures(object.list = pbmc.list)
+pbmc.list <- lapply(X = pbmc.list, FUN = function(x) {
+    x <- ScaleData(x, features = features, verbose = FALSE)
+    x <- RunPCA(x, features = features, verbose = FALSE)
+})
+
+immune.anchors <- FindIntegrationAnchors(object.list = pbmc.list, 
+                                         anchor.features = features, 
+                                         reduction = "rpca")
+
+pbmc.combined <- IntegrateData(anchorset = immune.anchors)
+
+DefaultAssay(pbmc.combined) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+pbmc.combined <- ScaleData(pbmc.combined, verbose = FALSE)
+pbmc.combined <- RunPCA(pbmc.combined, npcs = 30, verbose = FALSE)
+pbmc.combined <- RunUMAP(pbmc.combined, reduction = "pca", dims = 1:10)
+
+DimPlot(pbmc.combined)
+DimPlot(pbmc.combined, group.by = 'Sample.Name', cols = 'glasbey')
+DimPlot(pbmc.combined, group.by = 'group', cols = 'glasbey')
+
+DimPlot(pbmc.combined, split.by = 'group',  
+        group.by = 'group',
+        cols = 'glasbey')
+
+DimPlot(pbmc.combined, split.by = 'patientid',  
+        group.by = 'patientid',
+        cols = 'glasbey', ncol = 4)
+
+### Cell type annotation - Azimuth
+library(Azimuth)
+library(SeuratData)
+
+DefaultAssay(pbmc.combined) <- 'RNA'
+
+pbmc.azi <- RunAzimuth(pbmc.combined, reference = "pbmcref")
+
+DimPlot(pbmc.azi, group.by = 'predicted.celltype.l1')
+DimPlot(pbmc.azi, group.by = 'predicted.celltype.l2', cols = 'glasbey')
+DimPlot(pbmc.azi, group.by = 'Sample.Number', cols = 'glasbey')
+DimPlot(pbmc.azi, group.by = 'group', cols = 'glasbey')
+
+DimPlot(pbmc.azi, group.by = 'group', split.by = 'group', cols = 'glasbey')
+
+#### ATAC
+DefaultAssay(pbmc.azi) <- "peaks"
+
+pbmc.azi <- FindTopFeatures(pbmc.azi, min.cutoff = 5) %>% 
+  RunTFIDF() %>% 
+  RunSVD()
+
+DepthCor(pbmc.azi)
+
+pbmc.azi <- RunUMAP(pbmc.azi, reduction = 'lsi', dims = 2:10, 
+                    reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+
+DimPlot(pbmc.azi)
+
+DimPlot(pbmc.azi, group.by = 'Sample.Name', cols = 'glasbey')
+
+DimPlot(pbmc.azi, split.by = 'group', ncol = 4, 
+        group.by = 'group',
+        cols = 'glasbey')
+
+## WNN Integration
+DefaultAssay(pbmc.azi) <- 'integrated'
+
+pbmc.azi <- FindMultiModalNeighbors(pbmc.azi, reduction.list = list("pca", "lsi"),
+                                    dims.list = list(1:10, 2:10),
+                                    modality.weight.name = "RNA.weight",
+                                    verbose = TRUE)
+
+# build a joint UMAP visualization
+pbmc.azi <- RunUMAP(pbmc.azi, nn.name = "weighted.nn", reduction.name = "wnn.umap",
+                    reduction.key = "wnnUMAP_", verbose = TRUE)
+
+DimPlot(pbmc.azi, reduction = 'wnn.umap')
+
+DimPlot(pbmc.azi, reduction = 'wnn.umap', 
+        group.by = 'Sample.Name', 
+        cols = 'glasbey')
+
+DimPlot(pbmc.azi, reduction = 'wnn.umap', 
+        group.by = 'group',
+        split.by = 'group',
+        cols = 'glasbey')
+
+DimPlot(pbmc.azi, reduction = 'wnn.umap', 
+        group.by = 'predicted.celltype.l2', cols = 'glasbey')
+
+## SingleR annotation
+pbmc.data <- as.data.frame(GetAssayData(pbmc.azi, slot = "data", assay = 'RNA'))
+
+library(celldex)
+monaco.ref <- MonacoImmuneData()
+
+pbmc.main <- SingleR(test = pbmc.data, ref = monaco.ref, 
+                     labels = monaco.ref$label.main)
+
+pbmc.fine <- SingleR(test = pbmc.data, ref = monaco.ref, 
+                     labels = monaco.ref$label.fine)
+
+pbmc.azi$label.main <- pbmc.main$labels
+pbmc.azi$label.main.pruned <- pbmc.main$pruned.labels
+
+pbmc.azi$label.fine <- pbmc.fine$labels
+pbmc.azi$label.fine.pruned <- pbmc.fine$pruned.labels
+
+DimPlot(pbmc.azi, reduction = 'wnn.umap', group = 'label.fine', cols = 'glasbey')
+
+saveRDS(pbmc.azi, 'pbmc.wnn.azimuth.singler.rds')
+```
+
+```{r Exploratory plots}
+#pbmc <- readRDS('data/processed/pbmc.wnn.azi.singler.dbltfinder.rds')
+
+DimPlot(pbmc, group.by = 'predicted.celltype.l1', label = T, label.box = T,
+        repel = T, reduction = 'wnn.umap') + NoLegend()
+
+DimPlot(pbmc, group.by = 'predicted.celltype.l2', label = T, label.box = T,
+        repel = T, reduction = 'wnn.umap') + NoLegend()
+
+DimPlot(pbmc, group.by = 'predicted.celltype.l1', label = T, label.box = T,
+        repel = T, reduction = 'wnn.umap') + NoLegend()
+
+DimPlot(pbmc, group.by = 'DF.classifications_0.25_0.2', reduction = 'wnn.umap')
+
+### Cell frequency
+# Calculate cell type frequency
+cell.freq  <- pbmc@meta.data %>% 
+  group_by(Sample.Number, timepoint, group) %>%
+  count(predicted.celltype.l1)  %>% 
+  mutate(freq = n/sum(n)) %>% 
+  ungroup() %>% 
+  mutate(timepoint = factor(timepoint, levels = c('Control', 'M0', 'M3', 'M6')))
+
+# Plot
+cell.freq %>% 
+  filter(!(predicted.celltype.l1 %in% c('other', 'other T'))) %>% 
+  ggplot(aes(x = timepoint, y = freq)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1, shape = 21, aes(fill = group)) +
+  facet_wrap(~predicted.celltype.l1) 
+
+# Compare cell type frequency across time points with Wilcox test
+cell.freq.stat <- cell.freq %>%
+  group_by(predicted.celltype.l1) %>% 
+  wilcox_test(freq ~ timepoint, ref.group = 'Control')
+```
+
+```{r Sample metadata}
+smpl.opioid <- readxl::read_excel('data/raw/CTN067_clinical_summary_and_PBMC_counts .xlsx') 
+
+smpl.opioid.clinical <- readxl::read_excel('data/raw/MASTER-CLINICAL-0067 STUDY data_12_23_20.xlsx')
+
+smpl.hiv <- readxl::read_excel('data/raw/CTN067_clinical_summary_and_PBMC_counts .xlsx', 
+                               sheet = 'HIV+ controls')
+
+control.tidy <- smpl.hiv |> 
+  select(`Lab ID`, `HIV Viral Load`, `CD4 count`) |> 
+  mutate(`HIV Viral Load` = as.numeric(sub('<', '', `HIV Viral Load`)),
+         `CD4 count` = as.numeric(sub(';.*', '', `CD4 count`)),
+         Treatment = 'Control', timepoint = 'Control') |> 
+  filter(!is.na(`HIV Viral Load`)) |> 
+  rename(`Viral load` = `HIV Viral Load`, CD4 = `CD4 count`) |> 
+  pivot_longer(-c(`Lab ID`, Treatment, timepoint), names_to = 'feature')
+
+smpl.opioid.tidy <- smpl.opioid %>% 
+  select(`Lab ID`, Treatment, `Viral load`, CD4) %>%
+  mutate(timepoint = sub('.*-M', 'M', `Lab ID`)) %>% 
+  mutate(timepoint = factor(timepoint, levels = c('M0', 'M3', 'M6'))) %>% 
+  mutate(`Viral load` = ifelse(`Viral load` == 'UD', 20, `Viral load`)) %>% 
+  mutate(`Viral load` = as.double(`Viral load`), CD4 = as.double(CD4)) |> 
+  pivot_longer(-c(`Lab ID`, Treatment, timepoint), names_to = 'feature') |> 
+  bind_rows(control.tidy)
+    
+  
+cd4.plot <- smpl.opioid.tidy %>% 
+  filter(feature == 'CD4') %>% 
+  ggplot(aes(x = timepoint, y = value, fill = Treatment)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(shape = 21,  position = position_jitterdodge(jitter.width = 0.1))
+
+#ggsave('results/figures/cd4_counts_opioid_users.pdf', cd4.plot, scale = 0.5)
+
+viral.load.plot <- smpl.opioid.tidy %>% 
+  filter(feature == 'Viral load') %>% 
+  ggplot(aes(x = timepoint, y = value, fill = Treatment)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(shape = 21,  position = position_jitterdodge(jitter.width = 0.1)) +
+  scale_y_continuous(trans = 'log10')
+
+#ggsave('results/figures/viral_load_opioid_users.pdf', viral.load.plot, scale = 0.5)
+cohort.cd4.vl <- smpl.opioid %>% 
+  left_join(smpl.opioid.clinical %>% 
+              select(PATID, AGE, SEX) %>% 
+              rename('Study ID' = PATID, Age = AGE, Sex = SEX) %>% 
+              mutate(Sex = ifelse(Sex == 1, 'M', 'F')) %>% 
+              mutate(`Study ID` = as.character(`Study ID`))) %>% 
+  select(`Lab ID`, Age, Sex, `Viral load`, CD4) %>% 
+  rename(`HIV Viral Load` = `Viral load`, `CD4 count` = CD4) %>% 
+  bind_rows(smpl.hiv %>% select(`Lab ID`, Age, Sex, `HIV Viral Load`, `CD4 count`))
+
+multiome.samples <- pbmc@meta.data %>% 
+  select(Sample.Name, timepoint) %>% 
+  unique() %>% 
+  mutate(id = sub('.* ', '', Sample.Name)) %>% 
+  mutate(id = gsub('_', '-', id)) %>%
+  mutate('id.timepoint' = paste(id, timepoint, sep = '-')) %>% 
+  select(-id) %>%  
+  mutate(id.timepoint = ifelse(grepl('CL67', id.timepoint), 
+                               sub('-Control', '', id.timepoint), 
+                               id.timepoint)) %>% 
+  left_join(cohort.cd4.vl, by = c('id.timepoint' = 'Lab ID')) %>% 
+  arrange(Sample.Name, timepoint)
+
+#write_tsv(multiome.samples, 
+#          'data/processed/cd4_counts_hiv_vl_multiome_samples.tsv')
+
+multiome.samples.for.plot <- multiome.samples %>% 
+#  filter(timepoint != 'Control') %>% 
+  select(Sample.Name, id.timepoint, `HIV Viral Load`, `CD4 count`) %>% 
+  mutate(`HIV Viral Load` = ifelse(`HIV Viral Load` == 'UD', 20, `HIV Viral Load`),
+         timepoint = sub('.*-', '', id.timepoint),
+         Treatment = sub('_M.*', '', Sample.Name)) %>% 
+  mutate(`HIV Viral Load` = as.double(`HIV Viral Load`),
+         `CD4 count` = as.double(`CD4 count`),
+         Treatment = sub('_', '-', Treatment),
+         Group = 'scMultiome\nsamples') %>% 
+  rename(`Viral load` = `HIV Viral Load`, CD4 = `CD4 count`, `Lab ID` = id.timepoint) %>% 
+  select(-Sample.Name) |> 
+  mutate(timepoint = ifelse(grepl('CL67', `Lab ID`), 'Control', timepoint),
+         Treatment = ifelse(grepl('CL67', `Lab ID`), 'Control', Treatment)) |> 
+  pivot_longer(-c(`Lab ID`, Treatment, timepoint, Group), names_to = 'feature')
+  
+viral.load.plot  
+smpl.opioid.tidy %>% 
+  filter(feature == 'Viral load') %>% 
+  ggplot(aes(x = timepoint, y = value, fill = Treatment)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(shape = 21,  position = position_jitterdodge(jitter.width = 0.15, seed = 21)) +
+  geom_jitter(data = multiome.samples.for.plot %>% filter(feature == 'Viral load'), 
+              shape = 21, position = position_jitterdodge(jitter.width = 0.15, seed = 21), 
+             size  = 3, stroke = 1, aes(colour = Group)) +
+   scale_color_manual(values = "red") +
+  scale_fill_manual(values = c("#66C2A5", "#8DA0CB", "#FC8D62")) +
+  scale_y_continuous(trans = 'log10') +
+  labs(y = 'Log10 HIV VL(cps/ml)')
+
+#ggsave('results/figures/viral_load_opioid_users.pdf', viral.load.plot, scale = 0.5)
+
+cd4.plot  <- smpl.opioid.tidy %>% 
+  filter(feature == 'CD4') %>% 
+  ggplot(aes(x = timepoint, y = value, fill = Treatment)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(shape = 21,  position = position_jitterdodge(jitter.width = 0.1, seed = 21)) +
+  geom_point(data = multiome.samples.for.plot %>% filter(feature == 'CD4'), 
+              shape = 21, position = position_jitterdodge(jitter.width = 0.1, seed = 21), 
+             size  = 3, stroke = 1, aes(colour = Group)) +
+  scale_color_manual(values = "red") +
+  scale_fill_manual(values = c("#66C2A5", "#8DA0CB", "#FC8D62")) +
+  labs(y = 'CD4 Counts')
+
+#ggsave('results/figures/cd4_counts_opioid_users.pdf', cd4.plot, scale = 0.5)
+
+```
+
+
