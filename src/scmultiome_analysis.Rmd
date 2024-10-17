@@ -686,7 +686,7 @@ scaled.expr <- t(scale(t(tnf.mono.cpm)))
 column_ha = HeatmapAnnotation(Group.timepoint = 
                                 sub('.067.*', '', sub('RNA.', '',colnames(scaled.expr))), 
                               col = list(Group.timepoint =  
-                                           c("TAU.M6" = "#66C2A5", "XR.NTX.M6" = "#8DA0CB")))
+                                         c("TAU.M6" = "#66C2A5", "XR.NTX.M6" = "#8DA0CB")))
   
 Heatmap(scaled.expr, name = 'z-score CPM',  show_column_names = F,
         width = unit(3, "cm"), height = unit(15, 'cm'),
